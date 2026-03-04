@@ -19,6 +19,7 @@ This repository contains the official implementation of **FLUID (Flexible Unidir
 
 # 🛠 Methodology
 
+![Main Figure](assets/main.png)
 FLUID bridges the gap between AR models and diffusion paradigms through two core architectural innovations:
 
 ### 1. Strictly Causal Diffusion Backbone
@@ -53,7 +54,7 @@ FLUID is trained via a two-stage process using LLaMA-Factory:
 Fine-tune the AR backbone (e.g., OpenPangu-7B) using a hybrid objective that combines AR generation and masked denoising.
 * **Duration**: 32,000 iterations.
 * **Optimization**: Rank-16 LoRA on the backbone.
-* 
+  
 * **Objective**: $\mathcal{L}_{Stage1} = \mathcal{L}_{AR} + \mathcal{L}_{Diff}$ under strictly causal constraints.
 
 ### Stage II: Probabilistic Horizon Calibration
