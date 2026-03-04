@@ -54,14 +54,12 @@ FLUID is trained via a two-stage process using LLaMA-Factory:
 Fine-tune the AR backbone (e.g., OpenPangu-7B) using a hybrid objective that combines AR generation and masked denoising.
 * **Duration**: 32,000 iterations.
 * **Optimization**: Rank-16 LoRA on the backbone.
-* **Objective**: $\mathcal{L}_{Stage1}$ = $\mathcal{L}_{AR}$ + $\mathcal{L}_{Diff}$ under strictly causal constraints.
+* **Objective**: $\mathcal{L}__{Stage1}$ =  ${L_{AR}$ + $\mathcal{L}_{Diff}$ under strictly causal constraints.
 
 ### Stage II: Probabilistic Horizon Calibration
 Freeze the backbone and train the **Diffusion K-Head** to predict the optimal generation stride.
 * **Duration**: 2,000 steps.
-* 
 * **Objective**: Minimizing KL divergence between predicted horizon distribution $P_{\phi}$ and Gaussian soft targets $\mathcal{Q}$.
-* 
 * **Confidence Threshold**: $\tau=2.8$ (Optimized for OpenPangu-7B).
 
 ---
