@@ -1,0 +1,53 @@
+#####  1.Qwen_mask_instruct
+### model 
+model_name_or_path: /opt/pangu/openpangu-embedded-7b-model
+# lora_adapter_path
+#sampler_state_dict
+trust_remote_code: true
+k_masks: 16
+IS_MDModel: true
+flash_attn: disabled
+
+### method
+stage: sft
+do_train: true
+finetuning_type: full
+# finetuning_type: lora
+# lora_rank: 16
+# lora_alpha: 32
+# lora_target: all
+pure_bf16: true
+deepspeed: /data/mxy/workspace/L-MTP-main/configs/ds_z2_config.json  # choices: [ds_z0_config.json, ds_z2_config.json, ds_z3_config.json]
+
+### dataset
+dataset: open_pangu_deepctrl,open_pangu_Infinity, open_pangu_ultrachat,open_pangu_moss
+# dataset: gsm8k_qwen3_32b_DS,alpaca_merged_10k
+# dataset: alpaca_merged_10k
+mix_strategy: concat
+template: openpangu_think
+cutoff_len: 512
+overwrite_cache: true
+preprocessing_num_workers: 16
+dataloader_num_workers: 4
+
+### output
+output_dir: /data/mxy/workspace/L-MTP-main/saves/openpangu/pangu_7B/head/curr
+logging_steps: 1
+# save_strategy: epoch
+save_strategy: steps
+save_steps: 1000
+plot_loss: true
+overwrite_output_dir: true
+save_only_model: false
+report_to: none  # choices: [none, wandb, tensorboard, swanlab, mlflow]
+
+### train
+per_device_train_batch_size: 2
+gradient_accumulation_steps: 1
+learning_rate: 2.0e-4
+num_train_epochs: 2
+lr_scheduler_type: cosine
+warmup_ratio: 0.1
+bf16: true
+ddp_timeout: 180000000
+resume_from_checkpoint: null
