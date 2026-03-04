@@ -68,7 +68,7 @@ Freeze the backbone and train the **Diffusion K-Head** to predict the optimal ge
 
 1.  **Clone LLaMA-Factory**:
     ```bash
-    git clone [https://github.com/hiyouga/LLaMA-Factory.git](https://github.com/hiyouga/LLaMA-Factory.git)
+    git clone https://github.com/hiyouga/LLaMA-Factory.git
     cd LLaMA-Factory
     pip install -e .[torch,metrics]
     ```
@@ -79,7 +79,7 @@ Freeze the backbone and train the **Diffusion K-Head** to predict the optimal ge
 3.  **Run Training**:
     Use the provided `fluid_pangu_7b.yaml` config:
     ```bash
-    llamafactory-cli train configs/fluid_pangu_7b.yaml
+    bash train.sh
     ```
 
 ---
