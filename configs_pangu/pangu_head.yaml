@@ -17,12 +17,10 @@ finetuning_type: full
 # lora_alpha: 32
 # lora_target: all
 pure_bf16: true
-deepspeed: /data/mxy/workspace/L-MTP-main/configs/ds_z2_config.json  # choices: [ds_z0_config.json, ds_z2_config.json, ds_z3_config.json]
+deepspeed: /workspace/configs/ds_z2_config.json  # choices: [ds_z0_config.json, ds_z2_config.json, ds_z3_config.json]
 
 ### dataset
 dataset: open_pangu_deepctrl,open_pangu_Infinity, open_pangu_ultrachat,open_pangu_moss
-# dataset: gsm8k_qwen3_32b_DS,alpaca_merged_10k
-# dataset: alpaca_merged_10k
 mix_strategy: concat
 template: openpangu_think
 cutoff_len: 512
@@ -31,7 +29,7 @@ preprocessing_num_workers: 16
 dataloader_num_workers: 4
 
 ### output
-output_dir: /data/mxy/workspace/L-MTP-main/saves/openpangu/pangu_7B/head/curr
+output_dir: /workspace/saves/openpangu/pangu_7B/head
 logging_steps: 1
 # save_strategy: epoch
 save_strategy: steps
