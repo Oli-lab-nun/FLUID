@@ -17,6 +17,20 @@ This repository contains the official implementation of **FLUID (Flexible Unidir
 
 ---
 
+# 🛠 Methodology
+
+FLUID bridges the gap between AR models and diffusion paradigms through two core architectural innovations:
+
+### 1. Strictly Causal Diffusion Backbone
+Departing from standard bidirectional diffusion models that require bidirectional attention , FLUID injects a lower-triangular attention mask into the Transformer. This restricts the conditional probability of restoring a token to depend solely on its causal history, preserving the inductive biases of pre-trained LLMs.
+
+### 2. Elastic Horizon Modeling
+To resolve the "Entropy-Horizon Dilemma," we replace fixed-size blocks with **Elastic Horizons**. A lightweight **Diffusion K-Head** predicts the optimal generation stride $K_t$ based on local confidence:
+- **High-confidence segments**: The model expands the horizon to "sprint" through predictable text.
+- **High-entropy transitions**: The model contracts the horizon for fine-grained, cautious reasoning.
+
+---
+
 ## 📊 Performance at a Glance
 
 FLUID-7B matches or exceeds top-tier AR and Diffusion baselines across standard benchmarks:
@@ -39,12 +53,15 @@ FLUID is trained via a two-stage process using LLaMA-Factory:
 Fine-tune the AR backbone (e.g., OpenPangu-7B) using a hybrid objective that combines AR generation and masked denoising.
 * **Duration**: 32,000 iterations.
 * **Optimization**: Rank-16 LoRA on the backbone.
+* 
 * **Objective**: $\mathcal{L}_{Stage1} = \mathcal{L}_{AR} + \mathcal{L}_{Diff}$ under strictly causal constraints.
 
 ### Stage II: Probabilistic Horizon Calibration
 Freeze the backbone and train the **Diffusion K-Head** to predict the optimal generation stride.
 * **Duration**: 2,000 steps.
+* 
 * **Objective**: Minimizing KL divergence between predicted horizon distribution $P_{\phi}$ and Gaussian soft targets $\mathcal{Q}$.
+* 
 * **Confidence Threshold**: $\tau=2.8$ (Optimized for OpenPangu-7B).
 
 ---
