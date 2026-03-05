@@ -30,6 +30,14 @@ To resolve the "Entropy-Horizon Dilemma," we replace fixed-size blocks with **El
 - **High-confidence segments**: The model expands the horizon to "sprint" through predictable text.
 - **High-entropy transitions**: The model contracts the horizon for fine-grained, cautious reasoning.
 
+## 📦 Model Weights
+
+The trained weights for **FLUID-7B** (adapted from OpenPangu-7B) are available on Hugging Face:
+
+| Model | Base Model | Adaptation Data | HF Link |
+| :--- | :--- | :--- | :--- |
+| **FLUID-7B** | OpenPangu-7B | 2.7B Tokens | [🤗 Download from Hugging Face](https://huggingface.co/JJAMXY/FLUID/tree/main) |
+
 ---
 
 ## 📊 Performance at a Glance
