@@ -100,7 +100,7 @@ class MyCustomModel(ModelAPI):
             remask=True,
         )
         
-        # generated_ids = self.model.generate_kv(
+        # generated_ids = self.model.generate_dynamic_kv(
         #     input_ids=model_inputs.input_ids,
         #     max_new_tokens=4096,
         #     block_size=16,              # 最大加速倍数
