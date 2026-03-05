@@ -6,8 +6,6 @@
 
 This repository contains the official implementation of **FLUID (Flexible Unidirectional Inference Diffusion)**, a framework designed to efficiently adapt pre-trained Autoregressive (AR) backbones into parallel diffusion models. By enforcing **Strictly Causal Alignment** and introducing **Elastic Horizons**, FLUID achieves state-of-the-art performance with orders of magnitude less training data compared to standard diffusion models.
 
----
-
 ## 🔥 Key Features
 
 * **Strictly Causal Alignment**: Unlike bidirectional diffusion, FLUID uses a lower-triangular attention mask to maintain the inductive biases of AR priors. This enables seamless initialization from GPT-style checkpoints like OpenPangu-7B.
