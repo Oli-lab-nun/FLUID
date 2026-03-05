@@ -25,21 +25,17 @@ class MyCustomModel(ModelAPI):
         **model_args: Dict[str, Any],
     ) -> None:
         super().__init__(model_name, base_url, api_key, config)
-
-        BASE_MODEL_PATH = "/.cache/modelscope/hub/models/FreedomIntelligence/openPangu-Embedded-7B"
+    
+        print("1.Loading FLUID...")
+        BASE_MODEL_PATH = "/workspace/saves/FLUID"
         DEVICE = _device
-
 
         base_model_skeleton = AutoModelForCausalLM.from_pretrained(BASE_MODEL_PATH, torch_dtype=torch.bfloat16,trust_remote_code=True)
         model = FLUID(base_model=base_model_skeleton, k_masks=16).to(device=DEVICE, dtype=torch.bfloat16)
         tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_PATH,trust_remote_code=True)
-        print("2. Updating Adapter...")
-        model.update_from_adapter("/saves/huawei/adapter-1")
 
-        model.update_from_adapter("/saves/huawei/adapter-2")
-
-        print("3. Updating Head...")
-        model.load_model_for_inference("/saves/huawei/head/2000")
+        print("2. Updating Head...")
+        model.load_model_for_inference("/workspace/saves/head/2000")
 
         model.set_tokenizer(tokenizer)
         self.model = model
