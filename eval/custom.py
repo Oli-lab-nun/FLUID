@@ -90,7 +90,7 @@ class MyCustomModel(ModelAPI):
         model_inputs = self.tokenizer([text], return_tensors="pt").to(self.model.device)
         """调用您的模型进行推理"""
 
-        generated_ids = self.model.infer(
+        generated_ids = self.model.generate_dynamic_kv(
             input_ids=model_inputs.input_ids,
             max_new_tokens=7000,
             block_size=16,              # 最大加速倍数
@@ -100,7 +100,7 @@ class MyCustomModel(ModelAPI):
             remask=True,
         )
         
-        # generated_ids = self.model.infer_kv(
+        # generated_ids = self.model.generate_kv(
         #     input_ids=model_inputs.input_ids,
         #     max_new_tokens=4096,
         #     block_size=16,              # 最大加速倍数
