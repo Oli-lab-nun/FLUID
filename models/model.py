@@ -4,7 +4,7 @@ import os
 import json
 import random
 from typing import Optional, List
-import sys
+
 from transformers import (
     AutoModelForCausalLM, 
     AutoTokenizer, 
@@ -16,7 +16,9 @@ from transformers.generation import GenerationMixin
 from transformers.utils import logging
 from transformers.cache_utils import DynamicCache
 from peft import PeftModel
-
+import sys
+import types
+from contextlib import contextmanager
 logging.set_verbosity_info()
 logger = logging.get_logger(__name__)
 
@@ -49,40 +51,28 @@ class FLUID(PreTrainedModel, GenerationMixin):
         self.k_masks = k_masks
         self.generation_config = self.model.generation_config
         
-        # store special token ID
+        # 用于存储需要屏蔽的模板特殊 token ID
         self.ignored_token_ids = []
+
+        # 回归模式预测一个标量 K (1.0 ~ max_k)
+        self.max_k = k_masks if k_masks else 0
+        self.diffusion_k_head = nn.Sequential(
+            nn.Linear(config.hidden_size, config.hidden_size // 4),
+            nn.GELU(),
+            nn.Linear(config.hidden_size // 4, self.max_k)
+        )  
+
+        # head training control 
+        self.loss_threshold = 2.8  # 语义熵阈值，平均 Loss 超过此值则认为扩散受阻
+        self.diffusion_k_head_train = True
+
     def set_tokenizer(self, tokenizer):
+
         self.tokenizer = tokenizer
-        # -------------------  openPangu  -------------------
-        name = getattr(tokenizer, "name_or_path", "") or ""
-        name = name.lower()
-    
-        if not name and hasattr(tokenizer, "_tokenizer_config"):
-            cfg_name = tokenizer._tokenizer_config.get("name_or_path", "")
-            name = cfg_name.lower()
-        is_openpangu = ("openpangu" in name)
 
-        if is_openpangu:
-            unused32_id = 144208     # select unused32 as mask embedding
-            self.mask_token_id = unused32_id
-            logger.info(f"[OpenPangu] 使用固定 mask_token_id={self.mask_token_id} (来自 unused32)")
-
-        # ------------------- other models -------------------
-        else:
-            mask_token = "<mask>"
-
-            if mask_token not in tokenizer.get_vocab():
-                tokenizer.add_special_tokens({"additional_special_tokens": [mask_token]})
-
-            self.mask_token_id = tokenizer.convert_tokens_to_ids(mask_token)
-            logger.info(f"[Normal] <mask> 正常添加, id={self.mask_token_id}")
-
-        # ------------------- publish ops-------------------
-        self.ignored_token_ids = tokenizer.all_special_ids
-        self.special_ids_tensor = torch.tensor(self.ignored_token_ids, dtype=torch.long)
-
-        logger.info(f"ignore token IDs: {self.ignored_token_ids}")
-        logger.info(f"mask_token_id is {self.mask_token_id}")
+        unused32_id = 144208     # openpangu mask embedding
+        self.mask_token_id = unused32_id
+        logger.info(f"[OpenPangu] 使用固定 mask_token_id={self.mask_token_id} (来自 unused32)")
 
     def _prepare_batch_vectorized(self, input_ids: torch.Tensor, labels: torch.Tensor):
         """
@@ -92,7 +82,6 @@ class FLUID(PreTrainedModel, GenerationMixin):
         3. Random Restoration of masks (0-50% ratio).
         4. Attention Mask ensures Prompt doesn't attend to template special tokens.
         """
-        # torch.set_printoptions(threshold=(2048))
         device = input_ids.device
         B, N = input_ids.shape
         
@@ -101,7 +90,6 @@ class FLUID(PreTrainedModel, GenerationMixin):
         shifted_labels[:, -1] = -100
 
         # --- 1. 确定 Mask 插入策略 (Requirement 1 & 3) ---
-        # 只有在 labels != -100 (即 Response 部分) 才允许插入
         is_response_col = (shifted_labels != -100).all(dim=0)
         
         # 生成基础概率 (N,)
@@ -138,7 +126,7 @@ class FLUID(PreTrainedModel, GenerationMixin):
         
         # 获取原始 Token
         expanded_inputs = input_ids[:, col_indices]
-        # 填充 Main Token 
+        # 填充 Main Token (is_mask 为 False 的位置)
         new_input_ids = torch.where(is_mask.unsqueeze(0), new_input_ids, expanded_inputs)
         
         # --- 4. 构建 New Position IDs 和 Labels ---
@@ -150,7 +138,8 @@ class FLUID(PreTrainedModel, GenerationMixin):
         
         expanded_targets = shifted_labels[:, safe_target_indices]
         new_labels = expanded_targets.masked_fill(~valid_target.unsqueeze(0), -100)
-
+        
+        # [Requirement 2 - Prompt NTP]
         # --- 5. 构建 Attention Mask ---
         # 准备广播向量
         block_ids = col_indices # (L_new,)
@@ -168,12 +157,10 @@ class FLUID(PreTrainedModel, GenerationMixin):
         # 初始化 -inf
         attn_bias = torch.full((L_new, L_new), float("-inf"), device=device)
         
-        # [Rule A] 保证 Main Token 之间可见性正常 (标准的 Causal Mask)
+        # [Rule A] Key 是 Main Token (且符合 Causal)
         mask_key_main = (k_type == 0) & (k_block <= q_block)
         
         # [Rule B] Key 是 Mask Token (Block 内部)
-        # 如果 k=0，types 全为 0，这一项全为 False，不影响结果
-        # 如果 k>0，允许 Mask 看到同一 Block 内之前的 Mask
         mask_key_mask = (k_type == 1) & (q_type == 1) & (k_block == q_block) & (k_step <= q_step)
         
         # 组合规则
@@ -221,9 +208,6 @@ class FLUID(PreTrainedModel, GenerationMixin):
                 # 检查哪些噪声命中了特殊 Token
                 is_special_noise = torch.isin(noise_tokens, self.special_ids_tensor)
                 
-                # 如果命中了，简单策略：直接用 real_tokens 覆盖它 (放弃这次噪声注入)
-                # 或者：再次随机 (为了性能，这里选择偏移策略或回退到真值)
-                # 这里采用回退策略：如果随机出特殊token，为了安全起见，这次就不加噪声了，算作运气好预测对了
                 noise_tokens = torch.where(is_special_noise, real_tokens, noise_tokens)
 
             # 4. 生成噪声掩码 (10% Noise Rate)
@@ -254,37 +238,40 @@ class FLUID(PreTrainedModel, GenerationMixin):
     ):
         if self.mask_token_id == -1:
              raise ValueError("Please call model.set_tokenizer(tokenizer) first.")
-
-        if labels is not None:
-            # 训练模式
-            (
-                new_input_ids, 
-                new_labels, 
-                new_position_ids, 
-                new_attention_mask
-            ) = self._prepare_batch_vectorized(input_ids, labels)
-            
-            outputs = self.model.model(
-                input_ids=new_input_ids,
-                attention_mask=new_attention_mask,
-                position_ids=new_position_ids,
-                use_cache=False, 
-                return_dict=True
-            )
-            
-            if hasattr(outputs, "logits"):
-                logits = outputs.logits
-            else:
-                hidden_states = outputs.last_hidden_state
-                logits = self.lm_head(hidden_states)
-            
-            loss = self.criterion(logits.view(-1, logits.size(-1)), new_labels.view(-1))
-            
-            return CausalLMOutputWithPast(loss=loss, logits=logits)
+        # head训练
+        if self.diffusion_k_head_train:
+            return self.train_head_forward(input_ids, labels)
+        # 常规训练
         else:
-            return self.model(input_ids=input_ids, labels=labels, attention_mask=attention_mask, **kwargs)
+            if labels is not None:
+                # 训练模式
+                (
+                    new_input_ids, 
+                    new_labels, 
+                    new_position_ids, 
+                    new_attention_mask
+                ) = self._prepare_batch_vectorized(input_ids, labels)
+                
+                outputs = self.model.model(
+                    input_ids=new_input_ids,
+                    attention_mask=new_attention_mask,
+                    position_ids=new_position_ids,
+                    use_cache=False, 
+                    return_dict=True
+                )
+                
+                if hasattr(outputs, "logits"):
+                    logits = outputs.logits
+                else:
+                    hidden_states = outputs.last_hidden_state
+                    logits = self.lm_head(hidden_states)
+                
+                loss = self.criterion(logits.view(-1, logits.size(-1)), new_labels.view(-1))
+                
+                return CausalLMOutputWithPast(loss=loss, logits=logits)
+            else:
+                return self.model(input_ids=input_ids, labels=labels, attention_mask=attention_mask, **kwargs)
             
-    # ... (Keep other methods unchanged: get_tokenizer, embeddings, etc.)
     def get_tokenizer(self):
         return self.tokenizer
     def get_input_embeddings(self):
@@ -298,375 +285,11 @@ class FLUID(PreTrainedModel, GenerationMixin):
         self.lm_head = new_embeddings
         self.model.set_output_embeddings(new_embeddings)
     def update_from_adapter(self, adapter_name):
-        # 引入必要的底层加载函数
-        from peft import PeftModel, PeftConfig
-        from peft.utils.save_and_load import load_peft_weights, set_peft_model_state_dict
-        import torch
-        
-        print(f"[Info] Loading adapter from {adapter_name}...")
-
-        # 1. 仅加载配置 
-        config = PeftConfig.from_pretrained(adapter_name)
-        
-        # 2. 初始化 PeftModel 结构，加载到 NPU 上
-        peft_model = PeftModel(self, config)
-        
-        # 3. 强制使用 'cpu' 读取权重文件
-        print("[Info] Manually loading weights to CPU RAM...")
-        adapter_weights = load_peft_weights(adapter_name, device="cpu")
-        
-        # 4. 将 CPU 上的权重注入到 NPU 模型中
-        print("[Info] Injecting weights into NPU model...")
-        set_peft_model_state_dict(peft_model, adapter_weights)
-        
-        # 5. 合并权重并卸载 Adapter
-        print("[Info] Merging and unloading...")
-        peft_model.merge_and_unload()
-        
-        # 6. 清理内存
-        del adapter_weights
+        peft_model = PeftModel.from_pretrained(self, adapter_name)
+        self = peft_model.merge_and_unload().to(torch.bfloat16) 
         del peft_model
-        if torch.npu.is_available():
-            torch.npu.empty_cache()
-            
-        print("Loading model done (Manual Method)")
-    @torch.no_grad()
-    def infer(
-        self, 
-        eos_token_id, 
-        input_ids, 
-        max_new_tokens=128, 
-        block_size=8,  
-        confidence_threshold=0.9,
-        remask=False, 
-    ):
-        if self.mask_token_id == -1:
-             raise ValueError("Please call model.set_tokenizer(tokenizer) first.")
-        device = input_ids.device
-        
-        initial_len = input_ids.shape[1]
-        current_ids = input_ids.clone()
-
-        # generating 
-        while current_ids.shape[1] - initial_len < max_new_tokens:
-            
-            context_len = current_ids.shape[1]
-            
-            # --- 1. generate Phase: Iterative Filling ---
-            generate_ids = torch.full(
-                (current_ids.shape[0], block_size), 
-                self.mask_token_id, 
-                dtype=current_ids.dtype, 
-                device=device
-            )
-            
-            bonus_token = None 
-            step = 0
-            refinement_count = 0 
-            
-            # block generating ...
-            while step < block_size:
-                inp = torch.cat([current_ids, generate_ids], dim=1)
-                
-                # Forward
-                outputs = self.model(input_ids=inp, use_cache=False)
-                
-                if hasattr(outputs, "logits"):
-                    logits = outputs.logits
-                else:
-                    hidden_states = outputs.last_hidden_state
-                    logits = self.lm_head(hidden_states)
-
-                relevant_logits = logits[:, context_len - 1 :, :] 
-                probs = torch.softmax(relevant_logits, dim=-1)
-                max_probs, best_ids = torch.max(probs, dim=-1)
-                
-                # A. Main Token 推进
-                generate_ids[:, step] = best_ids[:, step]
-                
-                # B. 并行扫描 + 跳跃
-                accepted_jump = 0
-
-                # 逻辑链条是否断裂
-                chain_broken = False
-                
-                for lookahead_idx in range(step + 1, block_size):
-                    conf = max_probs[:, lookahead_idx]
-                    bid = best_ids[:, lookahead_idx]
-                    
-                    if (conf > confidence_threshold).all():
-                        generate_ids[:, lookahead_idx] = bid
-                        if not chain_broken:
-                            accepted_jump += 1
-                    else:
-                        chain_broken = True
-
-                # 检查是否填满
-                if (generate_ids != self.mask_token_id).all():
-                    last_token_conf = max_probs[:, -1]
-                    last_token_id = best_ids[:, -1]
-                    if (last_token_conf > confidence_threshold).all():
-                        bonus_token = last_token_id.unsqueeze(1)
-                    break
-                
-                step += (1 + accepted_jump)
-                refinement_count += 1
-
-            # --- 2. remask Phase ---
-            segment_to_remask = generate_ids
-            if bonus_token is not None:
-                segment_to_remask = torch.cat([generate_ids, bonus_token], dim=1)
-            
-            # 如果不开启remask，直接生成
-            if not remask:
-                current_ids = torch.cat([current_ids, segment_to_remask], dim=1)
-            
-            else:
-                # remask
-                full_sequence = torch.cat([current_ids, segment_to_remask], dim=1)
-                
-                # new forward
-                new_outputs = self.model(input_ids=full_sequence, use_cache=False)
-                
-                if hasattr(new_outputs, "logits"):
-                    new_logits = new_outputs.logits
-                else:
-                    new_logits = self.lm_head(new_outputs.last_hidden_state)
-                
-                segment_len = segment_to_remask.shape[1]
-                pred_logits = new_logits[:, context_len - 1 : context_len - 1 + segment_len, :]
-                pre_gen_tokens = segment_to_remask
-                
-
-                best_tokens = torch.argmax(pred_logits, dim=-1)
-                is_correct_mask = (pre_gen_tokens == best_tokens)
-
-                mismatch_indices = (~is_correct_mask).nonzero(as_tuple=True)
-                
-                if len(mismatch_indices[1]) > 0:
-                    first_fail_idx = mismatch_indices[1][0].item()
-                    print(f"Mismatch at {first_fail_idx}. remasking...")
-                    
-                    # remask
-                    best_correct_token = torch.argmax(pred_logits[:, first_fail_idx, :], dim=-1).unsqueeze(1)
-                    
-                    if first_fail_idx > 0:
-                        valid_part = segment_to_remask[:, :first_fail_idx]
-                        new_extension = torch.cat([valid_part, best_correct_token], dim=1)
-                    else:
-                        new_extension = best_correct_token
-                        
-                    current_ids = torch.cat([current_ids, new_extension], dim=1)
-                else:
-                    current_ids = full_sequence 
-
-            # --- 3. EOS Check ---
-            newly_added_start = context_len
-            if current_ids.shape[1] > newly_added_start:
-                new_part = current_ids[:, newly_added_start:]
-                if eos_token_id is not None and (new_part == eos_token_id).any():
-                    eos_indices = (new_part == eos_token_id).nonzero(as_tuple=True)
-                    if len(eos_indices[1]) > 0:
-                        first_eos_local = eos_indices[1].min().item()
-                        current_ids = current_ids[:, :newly_added_start + first_eos_local + 1]
-                    break
-        
-        return current_ids 
-
-    @torch.no_grad()
-    def infer_kv(
-        self, 
-        eos_token_id, 
-        input_ids, 
-        max_new_tokens=128, 
-        block_size=8, 
-        confidence_threshold=0.9,
-        remask=False,
-    ):
-        if self.mask_token_id == -1:
-             raise ValueError("Please call model.set_tokenizer(tokenizer) first.")
-        
-        # ================= NPU Patch Start =================
-        # 动态获取定义了 NPU_ATTN_INFR 的模块 (即 modeling_openpangu_dense)
-        # 目的是在生成期间临时关闭 NPU 融合算子，避免 Kernel 崩溃
-        base_model_module = sys.modules[self.model.model.__module__]
-        original_npu_flag = getattr(base_model_module, "NPU_ATTN_INFR", False)
-        
-        # 强制关闭 NPU Fused Attention
-        # 这会迫使模型走 eager_attention_forward 或 SDPA，它们支持 Block Draft (Q>1 + Cache)
-        if original_npu_flag:
-            setattr(base_model_module, "NPU_ATTN_INFR", False)
-            # logger.info("Temporarily disabled NPU_ATTN_INFR for block generation.")
-        # ================= NPU Patch End =================
-
-        try:
-            device = input_ids.device
-            initial_len = input_ids.shape[1]
-            
-            # 1. 初始化 KV Cache
-            past_key_values = DynamicCache()
-            
-            # 2. Prefill & 获取 Prefix Logits
-            cache_position = torch.arange(initial_len, device=device)
-            outputs = self.model(
-                input_ids=input_ids, 
-                use_cache=True, 
-                past_key_values=past_key_values,
-                cache_position=cache_position
-            )
-            
-            if hasattr(outputs, "logits"):
-                prefix_next_token_logit = outputs.logits[:, -1:, :]
-            else:
-                hidden_states = outputs.last_hidden_state
-                prefix_next_token_logit = self.lm_head(hidden_states[:, -1:, :])
-
-            current_ids = input_ids.clone()
-            global_step_counter = 0
-
-            while current_ids.shape[1] - initial_len < max_new_tokens:
-                
-                prefix_len = past_key_values.get_seq_length()
-                
-                # init empty Block
-                generate_ids = torch.full(
-                    (input_ids.shape[0], block_size), 
-                    self.mask_token_id, 
-                    dtype=input_ids.dtype, 
-                    device=device
-                )
-                
-                bonus_token = None 
-                step = 0
-                refinement_count = 0 
-                current_prefix_logit = prefix_next_token_logit
-
-                # --- Generate Phase ---
-                while step < block_size:
-                    cache_position = torch.arange(prefix_len, prefix_len + block_size, device=device)
-                    
-                    outputs = self.model(
-                        input_ids=generate_ids, 
-                        use_cache=True, 
-                        past_key_values=past_key_values,
-                        cache_position=cache_position
-                    )
-                    
-                    generate_logits = outputs.logits if hasattr(outputs, "logits") else self.lm_head(outputs.last_hidden_state)
-                    full_logits = torch.cat([current_prefix_logit, generate_logits], dim=1)
-
-                    probs = torch.softmax(full_logits, dim=-1)
-                    max_probs, best_ids = torch.max(probs, dim=-1)
-                    
-                    generate_ids[:, step] = best_ids[:, step]
-                    
-                    accepted_jump = 0
-                    chain_broken = False
-                    for lookahead_idx in range(step + 1, block_size):
-                        if (max_probs[:, lookahead_idx] > confidence_threshold).all():
-                            generate_ids[:, lookahead_idx] = best_ids[:, lookahead_idx]
-                            if not chain_broken: accepted_jump += 1
-                        else:
-                            chain_broken = True
-                    
-                    global_step_counter += 1
-
-                    if (generate_ids != self.mask_token_id).all():
-                        if (max_probs[:, block_size] > confidence_threshold).all():
-                            bonus_token = best_ids[:, block_size].unsqueeze(1)
-                        past_key_values.crop(prefix_len)
-                        break
-                    
-                    past_key_values.crop(prefix_len)
-                    step += (1 + accepted_jump)
-                    refinement_count += 1
-
-                # --- Remask Phase ---
-                segment_to_remask = generate_ids
-                if bonus_token is not None:
-                    segment_to_remask = torch.cat([generate_ids, bonus_token], dim=1)
-                
-                final_segment = None
-                
-                if not remask:
-                    final_segment = segment_to_remask
-                    cache_position = torch.arange(prefix_len, prefix_len + final_segment.shape[1], device=device)
-                    outputs = self.model(
-                        input_ids=final_segment,
-                        use_cache=True,
-                        past_key_values=past_key_values,
-                        cache_position=cache_position
-                    )
-                    logits = outputs.logits if hasattr(outputs, "logits") else self.lm_head(outputs.last_hidden_state)
-                    prefix_next_token_logit = logits[:, -1:, :]
-                else:
-                    cache_position = torch.arange(prefix_len, prefix_len + segment_to_remask.shape[1], device=device)
-                    new_outputs = self.model(
-                        input_ids=segment_to_remask,
-                        use_cache=True,
-                        past_key_values=past_key_values,
-                        cache_position=cache_position
-                    )
-                    new_logits = new_outputs.logits if hasattr(new_outputs, "logits") else self.lm_head(new_outputs.last_hidden_state)
-                    
-                    full_new_logits = torch.cat([current_prefix_logit, new_logits[:, :-1, :]], dim=1)
-                    
-                    # remask
-                    pred_logits = full_new_logits
-                    min_len = min(pred_logits.shape[1], segment_to_remask.shape[1])
-                    pred_logits = pred_logits[:, :min_len, :]
-                    target_tokens = segment_to_remask[:, :min_len]
-
-                    
-                    is_correct_mask = (target_tokens == torch.argmax(pred_logits, dim=-1))
-
-                    mismatch_indices = (~is_correct_mask).nonzero(as_tuple=True)
-                    
-                    if len(mismatch_indices[1]) > 0:
-                        past_key_values.crop(prefix_len) # Rollback
-                        first_fail_idx = mismatch_indices[1][0].item()
-                        print(f"Mismatch at {first_fail_idx}. Correcting...")
-                        best_correct_token = torch.argmax(pred_logits[:, first_fail_idx, :], dim=-1).unsqueeze(1)
-                        
-                        if first_fail_idx > 0:
-                            final_segment = torch.cat([segment_to_remask[:, :first_fail_idx], best_correct_token], dim=1)
-                        else:
-                            final_segment = best_correct_token
-                        
-                        # commit
-                        cache_position = torch.arange(prefix_len, prefix_len + final_segment.shape[1], device=device)
-                        outputs = self.model(
-                            input_ids=final_segment,
-                            use_cache=True,
-                            past_key_values=past_key_values,
-                            cache_position=cache_position
-                        )
-                        logits = outputs.logits if hasattr(outputs, "logits") else self.lm_head(outputs.last_hidden_state)
-                        prefix_next_token_logit = logits[:, -1:, :]
-                    else:
-                        final_segment = segment_to_remask
-                        prefix_next_token_logit = new_logits[:, -1:, :]
-
-                # --- Update current_ids & EOS Check ---
-                current_ids = torch.cat([current_ids, final_segment], dim=1)
-
-                if eos_token_id is not None:
-                    is_eos = (final_segment == eos_token_id)
-                    if is_eos.any():
-                        first_eos_idx = is_eos.nonzero(as_tuple=True)[1].min().item()
-                        tokens_to_remove = final_segment.shape[1] - (first_eos_idx + 1)
-                        if tokens_to_remove > 0:
-                            current_ids = current_ids[:, :-tokens_to_remove]
-                        break
-
-            return current_ids
-            
-        finally:
-            # ================= Restore NPU Flag =================
-            # 无论生成是否成功，都要把标志位还原，以免影响其他代码的正常运行
-            if original_npu_flag:
-                setattr(base_model_module, "NPU_ATTN_INFR", True)
-                # logger.info("Restored NPU_ATTN_INFR.")
+        torch.cuda.empty_cache()
+        print("Loading model done")
     def load_model_for_inference(model, head_checkpoint_path):
         
         # 3. 加载你刚刚单独保存的 Head
@@ -674,7 +297,7 @@ class FLUID(PreTrainedModel, GenerationMixin):
         
         if os.path.exists(head_weight_path):
             # 加载权重
-            state_dict = torch.load(head_weight_path, map_location="cpu")
+            state_dict = torch.load(head_weight_path, map_location="cpu", weights_only=False)
             
             # [关键] 使用 strict=False
             # 因为 state_dict 里只有 diffusion_k_head 的权重，
@@ -687,4 +310,357 @@ class FLUID(PreTrainedModel, GenerationMixin):
         else:
             print("警告: 未找到 Head 权重文件，使用随机初始化 (仅用于测试流程)。")
             
-        return model
+        # return model
+    @torch.no_grad()
+    def generate_dynamic_kv(
+        self, 
+        eos_token_id: int, 
+        end_think_token_id: int, 
+        input_ids: torch.LongTensor, 
+        max_new_tokens=128, 
+        block_size=16,              
+        confidence_threshold=0.9,
+        remask=True, 
+    ):
+        """
+        动态扩散步数预测：。
+        """
+        if self.mask_token_id == -1:
+             raise ValueError("Please call model.set_tokenizer(tokenizer) first.")
+        
+
+        device = input_ids.device
+        initial_len = input_ids.shape[1]
+
+        # 1. 初始化 KV Cache
+        past_key_values = DynamicCache()
+        
+        # 2. Prefill & 获取 Prefix Logits
+        # 我们需要 hidden_states 来做 K-Head 预测，所以要 output_hidden_states=True
+        cache_position = torch.arange(initial_len, device=device)
+        outputs = self.model(
+            input_ids=input_ids, 
+            use_cache=True, 
+            past_key_values=past_key_values,
+            cache_position=cache_position,
+            output_hidden_states=True # [DYNAMIC K] 需要 Hidden States
+        )
+        
+        if hasattr(outputs, "logits"):
+            prefix_next_token_logit = outputs.logits[:, -1:, :]
+            # 获取最后一个 token 的 hidden state 用于预测 K
+            # outputs.hidden_states 是一个 tuple，取最后一层
+            last_hidden_state = outputs.hidden_states[-1][:, -1:, :] 
+        else:
+            hidden_states = outputs.last_hidden_state
+            prefix_next_token_logit = self.lm_head(hidden_states[:, -1:, :])
+            last_hidden_state = hidden_states[:, -1:, :]
+
+        current_ids = input_ids.clone()
+        global_step_counter = 0
+
+        # ================= Main Generation Loop =================
+        while current_ids.shape[1] - initial_len < max_new_tokens:
+            
+            # --- [DYNAMIC K] 1. 预测动态 Block Size ---
+            # 使用上一步的 hidden state 预测这一步能跳多远
+            # pred_logits: (1, 1, 16) -> (1, 16)
+            k_logits = self.diffusion_k_head(last_hidden_state).squeeze(1)
+            
+            # 获取概率最高的 K 值 
+            pred_k_idx = torch.argmax(k_logits, dim=-1).item()
+            dynamic_k = pred_k_idx + 1  # 转换回 1-based
+            
+            # 限制 K 的范围 (1 <= K <= max_block_size)
+            # 即使预测了 16，如果我们显存不够或不想太激进，可以卡在 block_size
+            current_block_size = min(dynamic_k, block_size)
+            current_block_size = max(4, current_block_size) # 至少生成 1 个
+            
+            # current_block_size = 16
+            # -----------------------------------------------------
+
+            prefix_len = past_key_values.get_seq_length()
+            
+            # 初始化 Block (使用动态长度)
+            gen_ids = torch.full(
+                (input_ids.shape[0], current_block_size), 
+                self.mask_token_id, 
+                dtype=input_ids.dtype, 
+                device=device
+            )
+            
+            bonus_token = None 
+            step = 0
+            current_prefix_logit = prefix_next_token_logit
+
+            # print("当前预测步长：------>",current_block_size)
+            # ==========================
+            # Phase 1: 
+            # ==========================
+            while step < current_block_size:
+                cache_position = torch.arange(prefix_len, prefix_len + current_block_size, device=device)
+                
+                outputs = self.model(
+                    input_ids=gen_ids, 
+                    use_cache=True, 
+                    past_key_values=past_key_values,
+                    cache_position=cache_position
+                )
+                
+                gen_logits = outputs.logits if hasattr(outputs, "logits") else self.lm_head(outputs.last_hidden_state)
+                full_logits = torch.cat([current_prefix_logit, gen_logits], dim=1)
+
+                probs = torch.softmax(full_logits, dim=-1)
+                max_probs, best_ids = torch.max(probs, dim=-1)
+                
+                # Update 
+                gen_ids[:, step] = best_ids[:, step]
+                
+                # Check confidence jumps
+                accepted_jump = 0
+                chain_broken = False
+                for lookahead_idx in range(step + 1, current_block_size):
+                    if (max_probs[:, lookahead_idx] > confidence_threshold).all():
+                        gen_ids[:, lookahead_idx] = best_ids[:, lookahead_idx]
+                        if not chain_broken: accepted_jump += 1
+                    else:
+                        chain_broken = True
+                
+                global_step_counter += 1
+
+                if (gen_ids != self.mask_token_id).all():
+                    # if (max_probs[:, current_block_size] > confidence_threshold).all():
+                    #     bonus_token = best_ids[:, current_block_size].unsqueeze(1)
+                    past_key_values.crop(prefix_len)
+                    break
+                
+                past_key_values.crop(prefix_len) 
+                step += (1 + accepted_jump)
+
+            # 确保退出循环后 Cache 是干净的（只有 prefix）
+            past_key_values.crop(prefix_len)
+
+
+            # ==========================================
+            # Phase 2: remask & Commit
+            # ==========================================
+            segment_to_remask = gen_ids
+            if bonus_token is not None:
+                segment_to_remask = torch.cat([gen_ids, bonus_token], dim=1)
+            
+            final_segment = None
+            
+
+            should_perform_remask = remask
+
+            if not should_perform_remask:
+                # --- Path A: Fast Commit ---
+                final_segment = segment_to_remask
+                
+                cache_position = torch.arange(prefix_len, prefix_len + final_segment.shape[1], device=device)
+                outputs = self.model(
+                    input_ids=final_segment,
+                    use_cache=True,
+                    past_key_values=past_key_values,
+                    cache_position=cache_position,
+                    output_hidden_states=True # [DYNAMIC K] Update Hidden State
+                )
+                logits = outputs.logits if hasattr(outputs, "logits") else self.lm_head(outputs.last_hidden_state)
+                prefix_next_token_logit = logits[:, -1:, :]
+                
+                # [DYNAMIC K] 更新 last_hidden_state 为下一个循环做准备
+                last_hidden_state = outputs.hidden_states[-1][:, -1:, :]
+                
+            else:
+                cache_position = torch.arange(prefix_len, prefix_len + segment_to_remask.shape[1], device=device)
+                new_outputs = self.model(
+                    input_ids=segment_to_remask,
+                    use_cache=True,
+                    past_key_values=past_key_values,
+                    cache_position=cache_position,
+                    output_hidden_states=True # [DYNAMIC K] Update Hidden State (if accepted)
+                )
+                global_step_counter += 1
+
+                new_logits = new_outputs.logits if hasattr(new_outputs, "logits") else self.lm_head(new_outputs.last_hidden_state)
+                
+                full_new_logits = torch.cat([current_prefix_logit, new_logits[:, :-1, :]], dim=1)
+                pred_logits = full_new_logits
+                min_len = min(pred_logits.shape[1], segment_to_remask.shape[1])
+                pred_logits = pred_logits[:, :min_len, :]
+                target_tokens = segment_to_remask[:, :min_len]
+
+                is_correct_mask = (target_tokens == torch.argmax(pred_logits, dim=-1))
+
+                mismatch_indices = (~is_correct_mask).nonzero(as_tuple=True)
+                
+                if len(mismatch_indices[1]) > 0:
+                    past_key_values.crop(prefix_len) # Rollback
+                    first_fail_idx = mismatch_indices[1][0].item()
+                    
+                    best_correct_token = torch.argmax(pred_logits[:, first_fail_idx, :], dim=-1).unsqueeze(1)
+                    
+                    if first_fail_idx > 0:
+                        final_segment = torch.cat([segment_to_remask[:, :first_fail_idx], best_correct_token], dim=1)
+                    else:
+                        final_segment = best_correct_token
+                        
+                    # Re-commit
+                    cache_position = torch.arange(prefix_len, prefix_len + final_segment.shape[1], device=device)
+                    outputs = self.model(
+                        input_ids=final_segment,
+                        use_cache=True,
+                        past_key_values=past_key_values,
+                        cache_position=cache_position,
+                        output_hidden_states=True # [DYNAMIC K] Update Hidden State
+                    )
+                    logits = outputs.logits if hasattr(outputs, "logits") else self.lm_head(outputs.last_hidden_state)
+                    prefix_next_token_logit = logits[:, -1:, :]
+                    
+                    # [DYNAMIC K] 更新 last_hidden_state
+                    last_hidden_state = outputs.hidden_states[-1][:, -1:, :]
+                else:
+                    final_segment = segment_to_remask
+                    prefix_next_token_logit = new_logits[:, -1:, :]
+                    
+                    # [DYNAMIC K] 无需remask
+                    last_hidden_state = new_outputs.hidden_states[-1][:, -1:, :]
+
+            # --- 3. Update & EOS Check ---
+            current_ids = torch.cat([current_ids, final_segment], dim=1)
+
+            if eos_token_id is not None:
+                is_eos = (final_segment == eos_token_id)
+                if is_eos.any():
+                    first_eos_idx = is_eos.nonzero(as_tuple=True)[1].min().item()
+                    tokens_to_remove = final_segment.shape[1] - (first_eos_idx + 1)
+                    if tokens_to_remove > 0:
+                        current_ids = current_ids[:, :-tokens_to_remove]
+                    break
+
+        return current_ids
+    @torch.no_grad()
+    def generate_dynamic(
+        self, 
+        input_ids: torch.LongTensor, 
+        eos_token_id: int, 
+        end_think_token_id: int = None, 
+        max_new_tokens=128, 
+        block_size=16,              
+        confidence_threshold=0.9,
+        remask=True,
+    ):
+        device = input_ids.device
+        initial_len = input_ids.shape[1]
+        current_ids = input_ids.clone()
+
+        # 初始 Step: 获取第一个 hidden_state 用于第一次预测 K
+        outputs = self.model(input_ids=current_ids, output_hidden_states=True)
+        last_hidden_state = outputs.hidden_states[-1][:, -1:, :]
+        
+
+        # ================= Main Generation Loop =================
+        while current_ids.shape[1] - initial_len < max_new_tokens:
+            
+            # --- 1. 预测动态 Block Size ---
+            k_logits = self.diffusion_k_head(last_hidden_state).squeeze(1)
+            pred_k_idx = torch.argmax(k_logits, dim=-1).item()
+            dynamic_k = pred_k_idx + 1  # 预测出的 K
+            
+            current_block_size = min(dynamic_k, block_size)
+            # current_block_size = max(4, current_block_size) # 至少生成 1 个
+
+            # --- 2. generate Phase ---
+            gen_ids = torch.full(
+                (input_ids.shape[0], current_block_size), 
+                self.mask_token_id, 
+                dtype=input_ids.dtype, 
+                device=device
+            )
+            
+            step = 0
+            prefix_len = current_ids.shape[1]
+            
+            while step < current_block_size:
+                full_input = torch.cat([current_ids, gen_ids], dim=1)
+                outputs = self.model(input_ids=full_input, use_cache=False, output_hidden_states=False)
+                full_logits = outputs.logits
+                
+                draft_logits_section = full_logits[:, prefix_len-1 : prefix_len + current_block_size - 1, :]
+                probs = torch.softmax(draft_logits_section, dim=-1)
+                max_probs, best_ids = torch.max(probs, dim=-1)
+                
+                gen_ids[:, step] = best_ids[:, step]
+                
+                accepted_jump = 0
+                chain_broken = False
+                for lookahead_idx in range(step + 1, current_block_size):
+                    if (max_probs[:, lookahead_idx] > confidence_threshold).all():
+                        gen_ids[:, lookahead_idx] = best_ids[:, lookahead_idx]
+                        if not chain_broken: accepted_jump += 1
+                    else:
+                        chain_broken = True
+                
+                if (gen_ids != self.mask_token_id).all():
+                    break
+                
+                step += (1 + accepted_jump)
+
+            # ==========================================
+            # --- 3. Remask Phase ---
+            # ==========================================
+            segment_to_remask = gen_ids
+            full_new_input = torch.cat([current_ids, segment_to_remask], dim=1)
+            new_outputs = self.model(
+                input_ids=full_new_input,
+                use_cache=False,
+                output_hidden_states=True
+            )
+            
+            final_segment = segment_to_remask
+            last_hidden_state = new_outputs.hidden_states[-1][:, -1:, :]
+            
+            if remask:
+                full_new_logits = new_outputs.logits
+                logits_to_check = full_new_logits[:, prefix_len-1 : -1, :]
+                targets = segment_to_remask
+                
+                min_len = min(logits_to_check.shape[1], targets.shape[1])
+                logits_to_check = logits_to_check[:, :min_len, :]
+                targets = targets[:, :min_len]
+
+                _, topk_indices = torch.topk(logits_to_check, k=1, dim=-1)
+                is_correct_mask = (targets.unsqueeze(-1) == topk_indices).any(dim=-1)
+                mismatch_indices = (~is_correct_mask).nonzero(as_tuple=True)
+
+                if len(mismatch_indices[1]) > 0:
+                    first_fail_idx = mismatch_indices[1][0].item()
+                    best_correct_token = torch.argmax(logits_to_check[:, first_fail_idx, :], dim=-1).unsqueeze(1)
+                    
+                    if first_fail_idx > 0:
+                        final_segment = torch.cat([segment_to_remask[:, :first_fail_idx], best_correct_token], dim=1)
+                    else:
+                        final_segment = best_correct_token
+                    
+                    # commit
+                    full_recommit_input = torch.cat([current_ids, final_segment], dim=1)
+                    recommit_outputs = self.model(
+                        input_ids=full_recommit_input,
+                        use_cache=False,
+                        output_hidden_states=True
+                    )
+                    last_hidden_state = recommit_outputs.hidden_states[-1][:, -1:, :]
+
+
+            # --- 4. Update & EOS Check ---
+            if eos_token_id is not None:
+                is_eos = (final_segment == eos_token_id)
+                if is_eos.any():
+                    first_eos_idx = is_eos.nonzero(as_tuple=True)[1].min().item()
+                    final_segment = final_segment[:, :first_eos_idx]
+                    current_ids = torch.cat([current_ids, final_segment], dim=1)
+                    break
+            
+            current_ids = torch.cat([current_ids, final_segment], dim=1)
+
+        return current_ids
