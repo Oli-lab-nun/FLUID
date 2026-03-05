@@ -52,7 +52,7 @@ print("Start generating...")
 eos_id = tokenizer.eos_token_id
 
 
-generated_ids = model.generate_dynamic(
+generated_ids = model.generate_dynamic_kv(
     input_ids=model_inputs.input_ids,
     max_new_tokens=2048,
     block_size=16,              # 最大加速倍数
