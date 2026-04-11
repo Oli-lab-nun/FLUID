@@ -87,6 +87,19 @@ Freeze the backbone and train the **Diffusion K-Head** to predict the optimal ge
 
 ---
 
+## 🙏 Acknowledgements
+
+This project is built upon the openPangu base model family. We sincerely thank the openPangu team for releasing their models and related resources to the community.
+
+Our FLUID-7B model is adapted from the openPangu base checkpoint, and this work would not have been possible without their efforts in model development and open release.
+
+**Powered by openPangu.**  
+**openPangu is a trademark of Huawei Technologies Co., Ltd.**
+
+Please refer to the original openPangu model repository and license for more details.
+
+---
+
 ## 📝 Citation
 
 If you find FLUID helpful in your research, please cite our work:
