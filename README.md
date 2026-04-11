@@ -8,7 +8,7 @@ This repository contains the official implementation of **FLUID (Flexible Unidir
 
 ## 🔥 Key Features
 
-* **Strictly Causal Alignment**: Unlike bidirectional diffusion, FLUID uses a lower-triangular attention mask to maintain the inductive biases of AR priors. This enables seamless initialization from GPT-style checkpoints like OpenPangu-7B.
+* **Strictly Causal Alignment**: Unlike bidirectional diffusion, FLUID uses a lower-triangular attention mask to maintain the inductive biases of AR priors. This enables seamless initialization from GPT-style checkpoints like openPangu-Embedded-7B.
 * **Elastic Horizon Modeling**: An entropy-driven mechanism that dynamically modulates denoising strides $K_t$ based on local information density. It "sprints" through predictable text and "downshifts" for complex reasoning.
 * **Training Efficiency**: Achieves superior results on GSM8K (91.9) and MATH500 (61.8) using only 2.7B tokens of adaptation data, outperforming models trained on trillions of tokens.
 * **LLaMA-Factory Integration**: Fully compatible with the LLaMA-Factory ecosystem for efficient LoRA fine-tuning and scaling.
@@ -30,11 +30,11 @@ To resolve the "Entropy-Horizon Dilemma," we replace fixed-size blocks with **El
 
 ## 📦 Model Weights
 
-The trained weights for **FLUID-7B** (adapted from OpenPangu-7B) are available on Hugging Face:
+The trained weights for **FLUID-7B** (adapted from openPangu-Embedded-7B) are available on Hugging Face:
 
 | Model | Base Model | Adaptation Data | HF Link |
 | :--- | :--- | :--- | :--- |
-| **FLUID-7B** | OpenPangu-7B | 2.7B Tokens | [🤗 Download from Hugging Face](https://huggingface.co/JJAMXY/FLUID/tree/main) |
+| **FLUID-7B** | openPangu-Embedded-7B | 2.7B Tokens | [🤗 Download from Hugging Face](https://huggingface.co/JJAMXY/FLUID/tree/main) |
 
 ---
 
@@ -57,7 +57,7 @@ FLUID-7B matches or exceeds top-tier AR and Diffusion baselines across standard 
 FLUID is trained via a two-stage process using LLaMA-Factory:
 
 ### Stage I: Joint Causal Backbone Training
-Fine-tune the AR backbone (e.g., OpenPangu-7B) using a hybrid objective that combines AR generation and masked denoising.
+Fine-tune the AR backbone (e.g., openPangu-Embedded-7B) using a hybrid objective that combines AR generation and masked denoising.
 * **Duration**: 32,000 iterations.
 * **Optimization**: Rank-16 LoRA on the backbone.
 * **Objective**: ${\mathcal{L}\_{Stage1}} = {L_{AR}} + {\mathcal{L}_{Diff}}$ under strictly causal constraints.
@@ -66,7 +66,7 @@ Fine-tune the AR backbone (e.g., OpenPangu-7B) using a hybrid objective that com
 Freeze the backbone and train the **Diffusion K-Head** to predict the optimal generation stride.
 * **Duration**: 2,000 steps.
 * **Objective**: Minimizing KL divergence between predicted horizon distribution $P_{\phi}$ and Gaussian soft targets $\mathcal{Q}$.
-* **Confidence Threshold**: $\tau=2.8$ (Optimized for OpenPangu-7B).
+* **Confidence Threshold**: $\tau=2.8$ (Optimized for openPangu-Embedded-7B).
 
 ---
 
@@ -89,14 +89,14 @@ Freeze the backbone and train the **Diffusion K-Head** to predict the optimal ge
 
 ## 🙏 Acknowledgements
 
-This project is built upon the openPangu base model family. We sincerely thank the openPangu team for releasing their models and related resources to the community.
+FLUID is developed based on the **openPangu-Embedded-7B** base model. We sincerely thank the openPangu team for releasing their model and related resources to the community, which made this research possible.
 
-Our FLUID-7B model is adapted from the openPangu base checkpoint, and this work would not have been possible without their efforts in model development and open release.
+Our **FLUID-7B** checkpoint is adapted from **openPangu-Embedded-7B**, and we gratefully acknowledge the original developers and maintainers of openPangu.
 
 **Powered by openPangu.**  
 **openPangu is a trademark of Huawei Technologies Co., Ltd.**
 
-Please refer to the original openPangu model repository and license for more details.
+Please refer to the original openPangu repository and the corresponding license files for more details.
 
 ---
 
